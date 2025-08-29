@@ -1,0 +1,1 @@
+"# mysql-to-manticore-search" 
