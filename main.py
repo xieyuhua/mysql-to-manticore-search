@@ -8,6 +8,7 @@ import logging
 import time
 from datetime import datetime
 import json
+import re
 
 class DatabaseSyncTool:
     def __init__(self):
@@ -31,7 +32,7 @@ class DatabaseSyncTool:
             'host': '192.168.2.6',
             'user': 'root',
             'password': 'bzdmmynj',
-            'database': 'bkshop',
+            'database': 'diygw',
             'ssl_disabled': True,
             'connection_timeout': 600
         }
@@ -50,6 +51,8 @@ class DatabaseSyncTool:
                 with mysql.connector.connect(**self.mysql_config) as conn:
                     with conn.cursor() as cursor:
                         cursor.execute("SHOW TABLES")
+                        # SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'
+                        # SHOW TABLES
                         tables = [table[0] for table in cursor.fetchall()]
                         self.logger.info(f"发现 {len(tables)} 个需要同步的表")
                         return tables
@@ -94,16 +97,19 @@ class DatabaseSyncTool:
 
                 # 表结构转换 mysql 
                 field_type = self._map_mysql_to_manticore_type(config['Type'])
-                # 表结构字段类型
-                self.table_field_type[f"{table_name}-{field}"] = field_type
+                
 
+                # 表结构字段类型
                 if field.lower() in self.keywords:
                     field_def = f"`new_{field}` {field_type}"
+                    self.table_field_type[f"{table_name}-new_{field}"] = field_type
                 elif field == 'id':
                     field_def = f"`table_{field}` {field_type}"
+                    self.table_field_type[f"{table_name}-table_{field}"] = field_type
                 else:
                     field_def = f"`{field}` {field_type}"
-                    
+                    self.table_field_type[f"{table_name}-{field}"] = field_type
+
                 fields.append(field_def)
                 
             self.utils_api.sql(f"DROP TABLE IF EXISTS `{table_name}`")
@@ -147,7 +153,6 @@ class DatabaseSyncTool:
             try:
                 with mysql.connector.connect(**self.mysql_config) as conn:
                     with conn.cursor(dictionary=True) as cursor:
-                        print(1111111111111)
                         query = f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s"
                         cursor.execute(query, (self.batch_size, offset))
                         rows = cursor.fetchall()
@@ -187,7 +192,8 @@ class DatabaseSyncTool:
                         # self.logger.error(2222222222222222222)
                         # bulk
                         respond = self.index_api.bulk(payload)
-                        self.logger.error(respond)
+                        if respond.error != '' :
+                            self.logger.error(respond)
 
                         offset += len(rows)
                         # self.logger.info(f"已同步 {table_name} {offset} 条记录")
@@ -195,7 +201,6 @@ class DatabaseSyncTool:
                 self.logger.error(f"数据库错误: {db_err}")
                 return False
             except Exception as e:
-                self.logger.error(payload)
                 self.logger.error(f"同步失败: {str(e)}")
                 return False
                 
@@ -246,9 +251,25 @@ class DatabaseSyncTool:
         # self.logger.error(doc)
         return doc
 
+def is_valid_table_name(name: str) -> bool:
+    """
+    校验表名是否符合规范（仅包含字母、数字和下划线）
+    
+    参数:
+        name: 待校验的表名字符串
+        
+    返回:
+        bool: 符合规范返回True，否则返回False
+    """
+    pattern = r'^[a-zA-Z0-9_]+$'
+    return bool(re.fullmatch(pattern, name))
+
 if __name__ == "__main__":
     sync_tool = DatabaseSyncTool()
     tables = sync_tool.get_all_tables()
     for table in tables:
-        sync_tool.sync_table(table)
+        if is_valid_table_name(table):
+            sync_tool.sync_table(table)
+        else:
+            print(f"表名不符合规范:", table)
         # break
