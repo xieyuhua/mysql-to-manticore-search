@@ -2,7 +2,7 @@
 import mysql.connector
 from manticoresearch import Configuration, ApiClient
 from manticoresearch.api import IndexApi, UtilsApi
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Union
 from decimal import Decimal
 import logging
 import time
@@ -22,6 +22,9 @@ class DatabaseSyncTool:
         self.index_api = IndexApi(self.client)
         self.utils_api = UtilsApi(self.client)
         self.batch_size = 1000
+        self.pri = {}
+        self.table_field_type = {}
+        self.keywords = {'order', 'rank', 'match', 'select', 'desc', 'group', 'by'}
 
     def _get_mysql_config(self) -> Dict[str, Any]:
         return {
@@ -64,7 +67,7 @@ class DatabaseSyncTool:
             schema = self._get_table_schema(table_name)
             if not schema:
                 return False
-                
+            
             # 创建Manticore索引
             if not self._create_manticore_index(table_name, schema):
                 return False
@@ -79,26 +82,35 @@ class DatabaseSyncTool:
     def _get_table_schema(self, table_name: str) -> Dict[str, Any]:
         with mysql.connector.connect(**self.mysql_config) as conn:
             with conn.cursor(dictionary=True) as cursor:
-                cursor.execute(f"DESCRIBE {table_name}")
+                cursor.execute(f"DESCRIBE `{table_name}`")
                 return {row['Field']: row for row in cursor.fetchall()}
 
     def _create_manticore_index(self, table_name: str, schema: Dict[str, Any]) -> bool:
         try:
             fields = []
             for field, config in schema.items():
+                if config['Key'] == 'PRI' and 'int' in config['Type'].lower():
+                    self.pri[table_name] = field
+
+                # 表结构转换 mysql 
                 field_type = self._map_mysql_to_manticore_type(config['Type'])
-                RESERVED_WORDS = {'order', 'rank', 'match', 'select', 'group', 'by'}
-                if field.lower() in RESERVED_WORDS:
+                # 表结构字段类型
+                self.table_field_type[f"{table_name}-{field}"] = field_type
+
+                if field.lower() in self.keywords:
                     field_def = f"`new_{field}` {field_type}"
+                elif field == 'id':
+                    field_def = f"`table_{field}` {field_type}"
                 else:
                     field_def = f"`{field}` {field_type}"
-
+                    
                 fields.append(field_def)
                 
-            self.utils_api.sql(f"DROP TABLE IF EXISTS {table_name}")
-            create_sql = f"CREATE TABLE {table_name} ({', '.join(fields)})"
-
+            self.utils_api.sql(f"DROP TABLE IF EXISTS `{table_name}`")
+            create_sql = f"CREATE TABLE `{table_name}` ({', '.join(fields)})"
             self.utils_api.sql(create_sql)
+
+            # self.logger.info(create_sql)
             return True
         except Exception as e:
             self.logger.error(create_sql)
@@ -106,11 +118,23 @@ class DatabaseSyncTool:
             return False
 
     def _map_mysql_to_manticore_type(self, mysql_type: str) -> str:
+        # 'string': '',
+        # 'text': '',
+        # 'integer': 0,
+        # 'float': 0.0,
+        # 'bool': False,
+        # 'json': [],
+        # 'timestamp': 0
+        # self.logger.info(mysql_type)
+        # self.logger.info('char' in mysql_type.lower())
+
         if 'int' in mysql_type.lower():
             return 'integer'
-        elif 'float' in mysql_type.lower() or 'double' in mysql_type.lower() or 'decimal' in mysql_type.lower():
+        elif 'float' in mysql_type.lower() or 'double' in mysql_type.lower():
             return 'float'
-        elif 'char' in mysql_type.lower() or 'text' in mysql_type.lower():
+        elif 'char' in mysql_type.lower() or 'decimal' in mysql_type.lower():
+            return 'string'
+        elif 'text' in mysql_type.lower():
             return 'text'
         elif 'date' in mysql_type.lower() or 'time' in mysql_type.lower():
             return 'timestamp'
@@ -123,75 +147,103 @@ class DatabaseSyncTool:
             try:
                 with mysql.connector.connect(**self.mysql_config) as conn:
                     with conn.cursor(dictionary=True) as cursor:
+                        print(1111111111111)
                         query = f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s"
                         cursor.execute(query, (self.batch_size, offset))
                         rows = cursor.fetchall()
                         if not rows:
                             break
-
+                        
                         # 构建符合Manticore Bulk API的请求体
                         bulk_actions = []
                         for row in rows:
-                            if 'id' not in row:
-                                doc = self.prepare_document(row)
+                            doc = self.prepare_document(row, table_name)
+                            # if 'id' not in row:
+                            # 方法1：直接判断键是否存在
+                            if table_name not in self.pri or self.pri[table_name] not in row:
                                 bulk_actions.append(json.dumps({
-                                    "insert": {
+                                    "replace": {
                                         "index": table_name,
                                         "doc": doc
                                     }
                                 }))
                                 # raise ValueError(f"文档缺少ID字段: {row}")
                             else:
-                                doc = self.prepare_document(row)
                                 # 将 insert 操作改为 replace 或 update 可自动处理冲突
                                 bulk_actions.append(json.dumps({
                                     "replace": {
                                         "index": table_name,
-                                        "id": row['id'],
+                                        "id": row[self.pri[table_name]],
                                         "doc": doc
                                     }
                                 }))
-                            # 每个操作必须用换行符分隔
-                            payload = "\n".join(bulk_actions)
-                            self.index_api.bulk(payload)
                             
-                            offset += len(rows)
-                            # self.logger.info(f"已同步 {table_name} {offset} 条记录")
-                        
+                        # 
+                        # 每个操作必须用换行符分隔
+                        payload = "\n".join(bulk_actions)
+                        # error
+                        # self.logger.error(1111111111111111111)
+                        # self.logger.error(payload)
+                        # self.logger.error(2222222222222222222)
+                        # bulk
+                        respond = self.index_api.bulk(payload)
+                        self.logger.error(respond)
+
+                        offset += len(rows)
+                        # self.logger.info(f"已同步 {table_name} {offset} 条记录")
             except mysql.connector.Error as db_err:
                 self.logger.error(f"数据库错误: {db_err}")
                 return False
             except Exception as e:
+                self.logger.error(payload)
                 self.logger.error(f"同步失败: {str(e)}")
                 return False
                 
         self.logger.info(f"同步完成，总计 {offset} 条记录")
         return True
 
-    def prepare_document(self, row: Dict) -> Dict:
+    def handle_null(self, field_type: str) -> Union[str, int, float, list]:
+        """根据字段类型返回对应的NULL替代值"""
+        type_handlers = {
+            'string': '',
+            'text': '',
+            'integer': 0,
+            'float': 0.0,
+            'bool': False,
+            'json': [],
+            'timestamp': 0
+        }
+        return type_handlers.get(field_type.lower(), '')
+
+    def prepare_document(self, row: Dict, table_name: str) -> Dict:
         """转换数据类型确保兼容Manticore"""
         doc = {}
-        for ks, v in row.items():
-            if ks == 'id':  # 跳过id列
-                continue
-            if v is None:
-                continue
+        for k, v in row.items():
             """转义关键词"""
-            RESERVED_WORDS = {'order', 'rank', 'match', 'select', 'group', 'by'}
-            if ks.lower() in RESERVED_WORDS:
-                ks = f"new_{ks}"
-                
+            if k.lower() in self.keywords:
+                k = f"new_{k}"
+            if k == 'id':  # 跳过id列
+                k = f"table_{k}"
+                # continue
+
+            # if v is None:
+            #     continue
+            """Type conversion dispatcher"""
             if isinstance(v, (bytes, bytearray)):
-                doc[ks] = v.decode('utf-8')
+                doc[k] = v.decode('utf-8', errors='replace')
             elif isinstance(v, (dict, list)):
-                doc[ks] = json.dumps(v)
-            elif isinstance(v, (Decimal)):
-                doc[ks] = str(v)
-                return str(v)  # 保持精度
+                doc[k] = json.dumps(v, ensure_ascii=False)
+            elif isinstance(v, Decimal):
+                doc[k] = float(v)
             elif isinstance(v, datetime):
-                return v.isoformat()
+                doc[k] = int(v.timestamp())
             else:
-                doc[ks] = v
+                doc[k] = v
+
+            if v is None:
+                doc[k] = self.handle_null(self.table_field_type[f"{table_name}-{k}"])
+            #     continue
+        # self.logger.error(doc)
         return doc
 
 if __name__ == "__main__":
@@ -199,3 +251,4 @@ if __name__ == "__main__":
     tables = sync_tool.get_all_tables()
     for table in tables:
         sync_tool.sync_table(table)
+        # break
